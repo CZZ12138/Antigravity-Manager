@@ -15,6 +15,7 @@ pub use streaming::{StreamingState, PartProcessor};
 use bytes::Bytes;
 use futures::Stream;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// 创建从 Gemini SSE 流到 Claude SSE 流的转换
 pub fn create_claude_sse_stream(
@@ -24,7 +25,6 @@ pub fn create_claude_sse_stream(
     use async_stream::stream;
     use futures::StreamExt;
     use bytes::BytesMut;
-    use std::sync::Arc;
 
     Box::pin(stream! {
         let mut state = StreamingState::new();
@@ -65,9 +65,6 @@ pub fn create_claude_sse_stream(
     })
 }
 
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::collections::HashMap;
 
 /// 处理单行 SSE 数据
 fn process_sse_line(line: &str, state: &mut StreamingState) -> Option<Vec<Bytes>> {

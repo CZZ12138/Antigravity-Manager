@@ -257,8 +257,11 @@ impl NonStreamingProcessor {
 }
 
 /// 转换 Gemini 响应为 Claude 响应 (公共接口)
-pub fn transform_response(gemini_response: &GeminiResponse) -> Result<ClaudeResponse, String> {
-    let mut processor = NonStreamingProcessor::new();
+pub fn transform_response(
+    gemini_response: &GeminiResponse,
+    signature_map: Option<Arc<Mutex<HashMap<String, String>>>>,
+) -> Result<ClaudeResponse, String> {
+    let mut processor = NonStreamingProcessor::new(signature_map);
     Ok(processor.process(gemini_response))
 }
 
@@ -293,7 +296,7 @@ mod tests {
             response_id: Some("resp_123".to_string()),
         };
 
-        let result = transform_response(&gemini_resp);
+        let result = transform_response(&gemini_resp, None);
         assert!(result.is_ok());
 
         let claude_resp = result.unwrap();
