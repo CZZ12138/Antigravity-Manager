@@ -20,6 +20,119 @@ use axum::http::HeaderMap;
 use std::sync::atomic::Ordering;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
+const MIN_SIGNATURE_LENGTH: usize = 10;  // 最小有效签名长度
+
+// ===== Thinking 块处理辅助函数 =====
+
+use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+
+/// 检查 thinking 块是否有有效签名
+fn has_valid_signature(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Thinking { signature, .. } => {
+            signature.as_ref().map_or(false, |s| s.len() >= MIN_SIGNATURE_LENGTH)
+        }
+        _ => true  // 非 thinking 块默认有效
+    }
+}
+
+/// 清理 thinking 块,只保留必要字段(移除 cache_control 等)
+fn sanitize_thinking_block(block: ContentBlock) -> ContentBlock {
+    match block {
+        ContentBlock::Thinking { thinking, signature, .. } => {
+            // 重建块,移除 cache_control 等额外字段
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                cache_control: None,
+            }
+        }
+        _ => block
+    }
+}
+
+/// 过滤消息中的无效 thinking 块
+fn filter_invalid_thinking_blocks(messages: &mut Vec<Message>) {
+    let mut total_filtered = 0;
+    
+    for msg in messages.iter_mut() {
+        // 只处理 assistant 消息
+        // [CRITICAL FIX] Handle 'model' role too (Google history usage)
+        if msg.role != "assistant" && msg.role != "model" {
+            continue;
+        }
+        tracing::error!("[DEBUG-FILTER] Inspecting msg with role: {}", msg.role);
+        
+        if let MessageContent::Array(blocks) = &mut msg.content {
+            let original_len = blocks.len();
+            
+            // 过滤并清理
+            let mut new_blocks = Vec::new();
+            for block in blocks.drain(..) {
+                if matches!(block, ContentBlock::Thinking { .. }) {
+                    // [DEBUG] 强制输出日志
+                    if let ContentBlock::Thinking { ref signature, .. } = block {
+                         tracing::error!("[DEBUG-FILTER] Found thinking block. Sig len: {:?}", signature.as_ref().map(|s| s.len()));
+                    }
+
+                    // [CRITICAL FIX] Vertex AI 不认可 skip_thought_signature_validator
+                    // 必须直接删除无效的 thinking 块
+                    if has_valid_signature(&block) {
+                        new_blocks.push(sanitize_thinking_block(block));
+                    } else {
+                        // 删除无效的 thinking 块
+                        tracing::warn!("[Claude-Handler] Dropping thinking block with invalid/missing signature");
+                    }
+                } else {
+                    new_blocks.push(block);
+                }
+            }
+            
+            *blocks = new_blocks;
+            let filtered_count = original_len - blocks.len();
+            total_filtered += filtered_count;
+            
+            // 如果过滤后为空,添加一个空文本块以保持消息有效
+            if blocks.is_empty() {
+                blocks.push(ContentBlock::Text { 
+                    text: String::new() 
+                });
+            }
+        }
+    }
+    
+    if total_filtered > 0 {
+        debug!("Filtered {} invalid thinking block(s) from history", total_filtered);
+    }
+}
+
+/// 移除尾部的无签名 thinking 块
+fn remove_trailing_unsigned_thinking(blocks: &mut Vec<ContentBlock>) {
+    if blocks.is_empty() {
+        return;
+    }
+    
+    // 从后向前扫描
+    let mut end_index = blocks.len();
+    for i in (0..blocks.len()).rev() {
+        match &blocks[i] {
+            ContentBlock::Thinking { .. } => {
+                if !has_valid_signature(&blocks[i]) {
+                    end_index = i;
+                } else {
+                    break;  // 遇到有效签名的 thinking 块,停止
+                }
+            }
+            _ => break  // 遇到非 thinking 块,停止
+        }
+    }
+    
+    if end_index < blocks.len() {
+        let removed = blocks.len() - end_index;
+        blocks.truncate(end_index);
+        debug!("Removed {} trailing unsigned thinking block(s)", removed);
+    }
+}
 
 // ===== 统一退避策略模块 =====
 
@@ -166,6 +279,14 @@ pub async fn handle_messages(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    tracing::error!(">>> [RED ALERT] handle_messages called! Body JSON len: {}", body.to_string().len());
+    
+    // 生成随机 Trace ID 用户追踪
+    let trace_id: String = rand::Rng::sample_iter(rand::thread_rng(), &rand::distributions::Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect::<String>().to_lowercase();
+        
     // Decide whether this request should be handled by z.ai (Anthropic passthrough) or the existing Google flow.
     let zai = state.zai.read().await.clone();
     let zai_enabled = zai.enabled && !matches!(zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
@@ -188,18 +309,8 @@ pub async fn handle_messages(
         }
     };
 
-    if use_zai {
-        return crate::proxy::providers::zai_anthropic::forward_anthropic_json(
-            &state,
-            axum::http::Method::POST,
-            "/v1/messages",
-            &headers,
-            body,
-        )
-        .await;
-    }
-
-    let request: ClaudeRequest = match serde_json::from_value(body) {
+    // [CRITICAL REFACTOR] 优先解析并过滤 Thinking 块，确保 z.ai 也是用修复后的 Body
+    let mut request: crate::proxy::mappers::claude::models::ClaudeRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -210,17 +321,37 @@ pub async fn handle_messages(
                         "type": "invalid_request_error",
                         "message": format!("Invalid request body: {}", e)
                     }
-                })),
-            )
-                .into_response();
+                }))
+            ).into_response();
         }
     };
 
-    // 生成随机 Trace ID 用户追踪
-    let trace_id: String = rand::Rng::sample_iter(rand::thread_rng(), &rand::distributions::Alphanumeric)
-        .take(6)
-        .map(char::from)
-        .collect::<String>().to_lowercase();
+    // [CRITICAL FIX] 过滤并修复 Thinking 块签名
+    filter_invalid_thinking_blocks(&mut request.messages);
+
+    if use_zai {
+        // 重新序列化修复后的请求体
+        let new_body = match serde_json::to_value(&request) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to serialize fixed request for z.ai: {}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+        return crate::proxy::providers::zai_anthropic::forward_anthropic_json(
+            &state,
+            axum::http::Method::POST,
+            "/v1/messages",
+            &headers,
+            new_body,
+        )
+        .await;
+    }
+    
+    // Google Flow 继续使用 request 对象
+    // (后续代码不需要再次 filter_invalid_thinking_blocks)
+
     // 获取最新一条“有意义”的消息内容（用于日志记录和后台任务检测）
     // 策略：反向遍历，首先筛选出所有角色为 "user" 的消息，然后从中找到第一条非 "Warmup" 且非空的文本消息
     // 获取最新一条“有意义”的消息内容（用于日志记录和后台任务检测）
@@ -416,6 +547,16 @@ pub async fn handle_messages(
                 trace_id,
                 mapped_model
             );
+            
+            // 对真实请求应用额外的清理:移除尾部无签名的 thinking 块
+            // 对真实请求应用额外的清理:移除尾部无签名的 thinking 块
+            for msg in request_with_mapped.messages.iter_mut() {
+                if msg.role == "assistant" || msg.role == "model" {
+                    if let crate::proxy::mappers::claude::models::MessageContent::Array(blocks) = &mut msg.content {
+                        remove_trailing_unsigned_thinking(blocks);
+                    }
+                }
+            }
         }
 
         
@@ -520,12 +661,19 @@ pub async fn handle_messages(
                 };
 
                 // [Optimization] 记录闭环日志：消耗情况
+                let cache_info = if let Some(cached) = claude_response.usage.cache_read_input_tokens {
+                    format!(", Cached: {}", cached)
+                } else {
+                    String::new()
+                };
+                
                 tracing::info!(
-                    "[{}] Request finished. Model: {}, Tokens: In {}, Out {}", 
+                    "[{}] Request finished. Model: {}, Tokens: In {}, Out {}{}", 
                     trace_id, 
                     request_with_mapped.model, 
                     claude_response.usage.input_tokens, 
-                    claude_response.usage.output_tokens
+                    claude_response.usage.output_tokens,
+                    cache_info
                 );
 
                 return Json(claude_response).into_response();
@@ -547,6 +695,7 @@ pub async fn handle_messages(
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效)
+        // 由于已经主动过滤,这个错误应该很少发生
         if status_code == 400
             && !retried_without_thinking
             && (error_text.contains("Invalid `signature`")
@@ -556,15 +705,24 @@ pub async fn handle_messages(
                 || error_text.contains("thinking.thinking"))
         {
             retried_without_thinking = true;
-            info!("[{}] Upstream rejected thinking signature; retrying once with thinking stripped", trace_id);
+            
+            // 使用 WARN 级别,因为这不应该经常发生(已经主动过滤过)
+            tracing::warn!(
+                "[{}] Unexpected thinking signature error (should have been filtered). \
+                 Retrying with all thinking blocks removed.",
+                trace_id
+            );
 
-            // 移除 thinking 配置
+            // 完全移除所有 thinking 相关内容
             request_for_body.thinking = None;
             
-            // 清理历史消息中的 Thinking Block
+            // 清理历史消息中的所有 Thinking Block
             for msg in request_for_body.messages.iter_mut() {
                 if let crate::proxy::mappers::claude::models::MessageContent::Array(blocks) = &mut msg.content {
-                    blocks.retain(|b| !matches!(b, crate::proxy::mappers::claude::models::ContentBlock::Thinking { .. }));
+                    blocks.retain(|b| !matches!(b, 
+                        crate::proxy::mappers::claude::models::ContentBlock::Thinking { .. } |
+                        crate::proxy::mappers::claude::models::ContentBlock::RedactedThinking { .. }
+                    ));
                 }
             }
             
@@ -588,11 +746,9 @@ pub async fn handle_messages(
         }
 
         // 5. 统一处理所有可重试错误
-        // 特殊处理：QUOTA_EXHAUSTED 不重试，直接返回保护账号池
-        if status_code == 429 && error_text.contains("QUOTA_EXHAUSTED") {
-            error!("[{}] Quota exhausted (429) on attempt {}/{}, stopping to protect pool.", trace_id, attempt + 1, max_attempts);
-            return (status, error_text).into_response();
-        }
+        // [REMOVED] 不再特殊处理 QUOTA_EXHAUSTED,允许账号轮换
+        // 原逻辑会在第一个账号配额耗尽时直接返回,导致"平衡"模式无法切换账号
+        
         
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, retried_without_thinking);
@@ -738,7 +894,7 @@ const SUGGESTION_KEYWORDS: &[&str] = &[
 const SYSTEM_KEYWORDS: &[&str] = &[
     "Warmup",
     "<system-reminder>",
-    "Caveat: The messages below were generated",
+    // Removed: "Caveat: The messages below were generated" - this is a normal Claude Desktop system prompt
     "This is a system message",
 ];
 

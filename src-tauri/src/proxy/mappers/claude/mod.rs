@@ -159,12 +159,20 @@ fn process_sse_line(line: &str, state: &mut StreamingState, trace_id: &str, emai
             .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok());
 
         if let Some(ref u) = usage {
+            let cached_tokens = u.cached_content_token_count.unwrap_or(0);
+            let cache_info = if cached_tokens > 0 {
+                format!(", Cached: {}", cached_tokens)
+            } else {
+                String::new()
+            };
+            
              tracing::info!(
-                 "[{}] ✓ Stream completed | Account: {} | In: {} tokens | Out: {} tokens", 
+                 "[{}] ✓ Stream completed | Account: {} | In: {} tokens | Out: {} tokens{}", 
                  trace_id,
                  email,
-                 u.prompt_token_count.unwrap_or(0), 
-                 u.candidates_token_count.unwrap_or(0)
+                 u.prompt_token_count.unwrap_or(0).saturating_sub(cached_tokens), 
+                 u.candidates_token_count.unwrap_or(0),
+                 cache_info
              );
         }
 
