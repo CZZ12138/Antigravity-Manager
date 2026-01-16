@@ -1082,7 +1082,7 @@ impl TokenManager {
     /// - `false`: 所有账号都不可用(被限流或被配额保护)
     /// 
     /// # 示例
-    /// ```rust
+    /// ```ignore
     /// // 检查是否有可用账号处理 claude-sonnet 请求
     /// let has_available = token_manager.has_available_account("claude", "claude-sonnet-4-20250514").await;
     /// if !has_available {
